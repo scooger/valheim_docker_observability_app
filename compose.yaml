@@ -1,0 +1,90 @@
+# Valheim dedicated server + Portainer
+# Valheim: https://hub.docker.com/r/lloesche/valheim-server
+# Portainer: https://hub.docker.com/r/portainer/portainer-ce
+
+services:
+  valheim:
+    image: lloesche/valheim-server:latest
+    container_name: valheim-server
+    restart: unless-stopped
+    stop_grace_period: 2m
+    env_file:
+      - .env
+    environment:
+      # Mirror join/leave lines into /config/player-events.log for the dashboard.
+      VALHEIM_LOG_FILTER_CONTAINS_SteamConnect: "Got connection SteamID"
+      ON_VALHEIM_LOG_FILTER_CONTAINS_SteamConnect: "/config/hooks/log-player-event.sh steam_connect"
+      VALHEIM_LOG_FILTER_CONTAINS_Handshake: "Got handshake from client"
+      ON_VALHEIM_LOG_FILTER_CONTAINS_Handshake: "/config/hooks/log-player-event.sh handshake"
+      VALHEIM_LOG_FILTER_CONTAINS_Spawned: "Got character ZDOID from"
+      ON_VALHEIM_LOG_FILTER_CONTAINS_Spawned: "/config/hooks/log-player-event.sh character"
+      VALHEIM_LOG_FILTER_CONTAINS_Disconnect: "Closing socket"
+      ON_VALHEIM_LOG_FILTER_CONTAINS_Disconnect: "/config/hooks/log-player-event.sh disconnect"
+      VALHEIM_LOG_FILTER_CONTAINS_ClosedByPeer: "ClosedByPeer"
+      ON_VALHEIM_LOG_FILTER_CONTAINS_ClosedByPeer: "/config/hooks/log-player-event.sh disconnect"
+    cap_add:
+      - SYS_NICE
+    ports:
+      # 2456 game, 2457 Steam query, 2458 crossplay / mod RPC
+      - "2456-2458:2456-2458/udp"
+    volumes:
+      - ./state/config:/config
+      - ./state/data:/opt/valheim
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: portainer
+    restart: unless-stopped
+    ports:
+      # HTTPS UI — LAN only; do not forward this on UniFi
+      - "9443:9443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./state/portainer:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  usage:
+    build: ./usage-web
+    image: valheim-usage:local
+    container_name: valheim-usage
+    restart: unless-stopped
+    # Access docker.sock while still running as nobody (see group_add).
+    group_add:
+      - "983"
+    ports:
+      # Usage UI — safe to forward only with PUBLIC_SESSION_GATE=true
+      - "8088:8080"
+    environment:
+      EVENTS_FILE: /data/player-events.log
+      NPS_DIR: /data/nps
+      METRICS_FILE: /data/metrics/metrics.jsonl
+      DOCKER_SOCK: /var/run/docker.sock
+      HOST_PROC: /host/proc
+      VALHEIM_CONTAINER: valheim-server
+      METRICS_INTERVAL: "15"
+      PORT: "8080"
+      # WAN: 404 unless a Valheim player is online. LAN (RFC1918) always allowed.
+      # Optional ACCESS_TOKEN unlocks WAN anytime (?token=... or X-Access-Token).
+      PUBLIC_SESSION_GATE: "true"
+      # ACCESS_TOKEN: "change-me"
+      # TRUST_PROXY: "true"   # only if behind a reverse proxy that sets X-Forwarded-For
+    volumes:
+      - ./state/config/player-events.log:/data/player-events.log:ro
+      - ./state/data/bepinex/BepInEx/NpsMonitoring:/data/nps:ro
+      - ./state/usage:/data/metrics
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /proc:/host/proc:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"

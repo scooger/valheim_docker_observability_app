@@ -90,7 +90,7 @@ Leave UPnP off. **Settings → Internet → UPnP** should stay disabled. These f
 
 ### Guest address
 
-This host uses a **static** address (`192.168.10.12/24`), gateway `192.168.10.1`. You do **not** need a UniFi DHCP reservation.
+This host uses a **static** address (`YOUR_LAN_IP/24`), gateway `YOUR_GATEWAY_IP`. You do **not** need a UniFi DHCP reservation.
 
 If you ever rebuild with DHCP instead, set a **Fixed IP** in UniFi (**Client Devices** → the VM) so the forward target cannot drift.
 
@@ -117,7 +117,7 @@ For each rule:
 - **WAN:** your primary WAN (or All, if you only have one)
 - **From:** Any
 - **Protocol:** UDP (not Both)
-- **Forward IP:** `192.168.10.12`
+- **Forward IP:** `YOUR_LAN_IP`
 - **Forward port:** the same number as the WAN port
 
 Saving a forward creates a matching firewall allow (External → the zone the guest lives in, often Internal). Leave that allow in place. You do not add a second firewall rule for the same ports.
@@ -126,9 +126,9 @@ Optional: if every friend has a stable public IP, set **From** to those addresse
 
 ### Play from inside the house
 
-People on your LAN join with `192.168.10.12:2456`. Joining your own public IP from inside the LAN (NAT hairpin) is unreliable. Outside players use the public WAN address and port 2456.
+People on your LAN join with `YOUR_LAN_IP:2456`. Joining your own public IP from inside the LAN (NAT hairpin) is unreliable. Outside players use the public WAN address and port 2456.
 
-If you previously forwarded to the old VM (`192.168.10.30`), update those UniFi rules to `192.168.10.12`.
+If you previously forwarded to the old VM (`YOUR_OLD_LAN_IP`), update those UniFi rules to `YOUR_LAN_IP`.
 
 ### Optional: put the guest on its own VLAN
 
@@ -142,7 +142,7 @@ Not required. If you want it off the main LAN:
 
 In Valheim: **Join Game → Join IP**.
 
-- Same house: `192.168.10.12:2456`
+- Same house: `YOUR_LAN_IP:2456`
 - From the internet: your public WAN address and port `2456`
 - Password: `SERVER_PASS` in `.env` on the guest
 
@@ -176,7 +176,7 @@ Packages always install at 03:00. A reboot runs only if the kernel/libc requires
 
 ## Portainer
 
-Portainer CE is in the same Compose file. UI: **https://192.168.10.12:9443**
+Portainer CE is in the same Compose file. UI: **https://YOUR_LAN_IP:9443**
 
 On first visit, create the admin user within 5 minutes (Portainer locks the wizard after that). Data lives in `state/portainer/`. Do **not** forward TCP 9443 on UniFi — keep it LAN-only. The socket mount gives Portainer full control of Docker on this host.
 
@@ -184,12 +184,12 @@ On first visit, create the admin user within 5 minutes (Portainer locks the wiza
 
 Separate image (`usage-web/`) serves sessions from `player-events.log`, NPS RTT from `NpsMonitoring/`, plus host/Valheim CPU and memory:
 
-- UI: **http://192.168.10.12:8088/** — summary min/avg/max for duration and latency; click a session for events + RTT chart
-- JSON: **http://192.168.10.12:8088/api/status** · session detail: `/api/session/<id>`
+- UI: **http://YOUR_LAN_IP:8088/** — summary min/avg/max for duration and latency; click a session for events + RTT chart
+- JSON: **http://YOUR_LAN_IP:8088/api/status** · session detail: `/api/session/<id>`
 
 Sessions under 2 minutes are flagged **short**. Latency appears once a client is online with NPS monitoring enabled (host self-RTT is filtered out). Resource samples live in `state/usage/metrics.jsonl`.
 
-**Public access gate** (`PUBLIC_SESSION_GATE=true`): LAN clients always see the UI. Internet clients get a bare `404` unless at least one Valheim player is currently online. This is presence-based, not login — anyone who knows the URL can view the dashboard for as long as someone is in-game. Optional `ACCESS_TOKEN` unlocks WAN anytime via `?token=` or `X-Access-Token`. Prefer Tailscale/VPN if you need real auth.
+**Public access** (`PUBLIC_PASSWORD_GATE` + `PUBLIC_SESSION_GATE`): LAN clients always see the UI with no login. Internet is **default-deny** (plain `404`) while nobody is in Valheim — no password prompt. When at least one player is online, WAN gets HTTP Basic Auth (`SERVER_PASS`, any username). Wrong password → 401. Optional `ACCESS_TOKEN` is an alternate WAN unlock.
 
 ```bash
 cd /opt/valheim-server

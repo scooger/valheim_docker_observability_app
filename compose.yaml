@@ -61,8 +61,10 @@ services:
     group_add:
       - "983"
     ports:
-      # Usage UI — safe to forward only with PUBLIC_SESSION_GATE=true
+      # Usage UI — WAN default-deny; password prompt only while a player is online
       - "8088:8080"
+    env_file:
+      - .env
     environment:
       EVENTS_FILE: /data/player-events.log
       NPS_DIR: /data/nps
@@ -72,8 +74,9 @@ services:
       VALHEIM_CONTAINER: valheim-server
       METRICS_INTERVAL: "15"
       PORT: "8080"
-      # WAN: 404 unless a Valheim player is online. LAN (RFC1918) always allowed.
-      # Optional ACCESS_TOKEN unlocks WAN anytime (?token=... or X-Access-Token).
+      # WAN: 404 if empty; if a player is online, Basic Auth with SERVER_PASS.
+      # LAN (RFC1918) always allowed, no login.
+      PUBLIC_PASSWORD_GATE: "true"
       PUBLIC_SESSION_GATE: "true"
       # ACCESS_TOKEN: "change-me"
       # TRUST_PROXY: "true"   # only if behind a reverse proxy that sets X-Forwarded-For

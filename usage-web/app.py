@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import base64
+import gzip
+import hmac
 import ipaddress
 import json
 import os
@@ -32,9 +35,16 @@ RESOURCE_WINDOWS_MIN = (10, 30, 90, 180, 720)
 DEFAULT_WINDOW_MIN = 30
 SPARK_POINTS = 480
 
-# Public exposure gate: LAN always allowed; WAN only while a Valheim player is online
-# (optional ACCESS_TOKEN also unlocks WAN). Not per-player auth — anyone who can
-# reach the URL during an active session can view the dashboard.
+# WAN gates (LAN / private IPs always allowed):
+# - PUBLIC_PASSWORD_GATE: HTTP Basic Auth; password must match SERVER_PASS
+# - PUBLIC_SESSION_GATE: optional extra — WAN also needs an online Valheim player
+# - ACCESS_TOKEN: optional alternate WAN unlock
+PUBLIC_PASSWORD_GATE = os.environ.get("PUBLIC_PASSWORD_GATE", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 PUBLIC_SESSION_GATE = os.environ.get("PUBLIC_SESSION_GATE", "false").lower() in (
     "1",
     "true",
@@ -43,7 +53,10 @@ PUBLIC_SESSION_GATE = os.environ.get("PUBLIC_SESSION_GATE", "false").lower() in 
 )
 TRUST_PROXY = os.environ.get("TRUST_PROXY", "false").lower() in ("1", "true", "yes", "on")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "").strip()
+SERVER_PASS = os.environ.get("SERVER_PASS", "").strip()
 DENIED_BODY = b"Not Found\n"
+# NPS RTT below this (ms) is treated as LAN; at/above as WAN. No client IPs available.
+LAN_RTT_MS = float(os.environ.get("LAN_RTT_MS", "8"))
 
 RE_STEAM = re.compile(r"(?:SteamID|from client|Closing socket)\s+(\d{14,})")
 RE_CHARACTER = re.compile(r"Got character ZDOID from (.+?) :\s*(\d+):\d+")
@@ -106,8 +119,29 @@ class SessionRecord:
     zdoid: str | None = None
     latency_ms: dict[str, Any] = field(default_factory=dict)
     nps_peer_id: str | None = None
+    network: str = "unknown"  # lan | wan | unknown (RTT heuristic)
+    sock: str | None = None
     events: list[dict[str, str]] = field(default_factory=list)
     rtt_series: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _classify_network(latency_ms: dict[str, Any], sock: str | None = None) -> str:
+    """Best-effort LAN/WAN label from NPS RTT (and non-direct sock ⇒ WAN)."""
+    sock_l = (sock or "").strip().lower()
+    if sock_l and sock_l not in ("direct", "none", "unknown"):
+        return "wan"
+    avg = latency_ms.get("avg")
+    if avg is None:
+        return "unknown"
+    try:
+        return "lan" if float(avg) < LAN_RTT_MS else "wan"
+    except (TypeError, ValueError):
+        return "unknown"
+
+
+def _nps_event_paths(folder: Path) -> list[Path]:
+    paths = list(folder.glob("events-*.jsonl")) + list(folder.glob("events-*.jsonl.gz"))
+    return sorted(paths, key=lambda p: p.name)
 
 
 def docker_api(path: str, timeout: float = 3.0) -> Any:
@@ -311,12 +345,16 @@ def parse_nps() -> dict[str, Any]:
     result["folders"] = [p.name for p in folders]
 
     for folder in folders:
-        for path in sorted(folder.glob("events-*.jsonl")):
+        for path in _nps_event_paths(folder):
             try:
-                text = path.read_text(encoding="utf-8", errors="replace")
+                if path.suffix == ".gz" or path.name.endswith(".jsonl.gz"):
+                    with gzip.open(path, "rt", encoding="utf-8", errors="replace") as fh:
+                        lines = fh.read().splitlines()
+                else:
+                    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
             except OSError:
                 continue
-            for line in text.splitlines():
+            for line in lines:
                 line = line.strip()
                 if not line:
                     continue
@@ -327,6 +365,15 @@ def parse_nps() -> dict[str, Any]:
                 kind = o.get("k")
                 if kind == "session":
                     result["host_id"] = str(o.get("host") or result["host_id"] or "")
+                    continue
+                if kind == "peer_sock":
+                    uid = str(o.get("uid") or "")
+                    if uid:
+                        peers = result["peers"].setdefault(
+                            uid, {"peer_id": uid, "rtt": [], "folder": folder.name}
+                        )
+                        if o.get("sock"):
+                            peers["sock"] = str(o.get("sock"))
                     continue
                 if kind != "peer":
                     continue
@@ -352,16 +399,22 @@ def parse_nps() -> dict[str, Any]:
                     uid, {"peer_id": uid, "rtt": [], "folder": folder.name}
                 )
                 peers["rtt"].append(rtt_ms)
+                if o.get("sock"):
+                    peers["sock"] = str(o.get("sock"))
                 result["rtt_samples"].append(sample)
 
     peer_summaries = []
     for peer_id, data in result["peers"].items():
         values = [float(v) for v in data["rtt"] if v is not None]
+        lat = _stats(values)
+        sock = data.get("sock")
         peer_summaries.append(
             {
                 "peer_id": peer_id,
                 "folder": data.get("folder"),
-                "latency_ms": _stats(values),
+                "latency_ms": lat,
+                "sock": sock,
+                "network": _classify_network(lat, sock if isinstance(sock, str) else None),
             }
         )
     result["peer_summaries"] = peer_summaries
@@ -557,12 +610,27 @@ def parse_player_events(path: Path) -> dict[str, Any]:
     }
 
 
+def _apply_peer_samples(sess: SessionRecord, peer_id: str, peer_samples: list[dict[str, Any]]) -> None:
+    values = [float(s["rtt_ms"]) for s in peer_samples]
+    socks = [str(s.get("sock")) for s in peer_samples if s.get("sock")]
+    sock = socks[-1] if socks else None
+    sess.nps_peer_id = peer_id
+    sess.latency_ms = _stats(values)
+    sess.sock = sock
+    sess.network = _classify_network(sess.latency_ms, sock)
+    sess.rtt_series = [
+        {"rtt_ms": s["rtt_ms"], "t": s.get("t"), "folder": s.get("folder")}
+        for s in peer_samples
+    ][-240:]
+
+
 def attach_latency(sessions: list[SessionRecord], nps: dict[str, Any]) -> None:
     """Attach NPS peer RTT to sessions via character ZDOID == peer uid."""
     samples = nps.get("rtt_samples") or []
     by_peer: dict[str, list[dict[str, Any]]] = {}
     for sample in samples:
         by_peer.setdefault(sample["peer_id"], []).append(sample)
+    peer_meta = {p["peer_id"]: p for p in (nps.get("peer_summaries") or [])}
 
     matched_peers: set[str] = set()
     unmatched: list[SessionRecord] = []
@@ -571,32 +639,25 @@ def attach_latency(sessions: list[SessionRecord], nps: dict[str, Any]) -> None:
         sess.latency_ms = _stats([])
         sess.rtt_series = []
         sess.nps_peer_id = None
+        sess.network = "unknown"
+        sess.sock = None
         if sess.zdoid and sess.zdoid in by_peer:
-            peer_samples = by_peer[sess.zdoid]
-            values = [float(s["rtt_ms"]) for s in peer_samples]
-            sess.nps_peer_id = sess.zdoid
-            sess.latency_ms = _stats(values)
-            sess.rtt_series = [
-                {"rtt_ms": s["rtt_ms"], "t": s.get("t"), "folder": s.get("folder")}
-                for s in peer_samples
-            ][-240:]
+            _apply_peer_samples(sess, sess.zdoid, by_peer[sess.zdoid])
+            if not sess.sock and sess.zdoid in peer_meta:
+                sess.sock = peer_meta[sess.zdoid].get("sock")
+                sess.network = _classify_network(sess.latency_ms, sess.sock)
             matched_peers.add(sess.zdoid)
         else:
             unmatched.append(sess)
 
-    # Fallback: one unmatched session + one unused peer → assign it
     leftover_peers = [pid for pid in by_peer if pid not in matched_peers]
     if len(unmatched) == 1 and len(leftover_peers) == 1:
         sess = unmatched[0]
         pid = leftover_peers[0]
-        peer_samples = by_peer[pid]
-        values = [float(s["rtt_ms"]) for s in peer_samples]
-        sess.nps_peer_id = pid
-        sess.latency_ms = _stats(values)
-        sess.rtt_series = [
-            {"rtt_ms": s["rtt_ms"], "t": s.get("t"), "folder": s.get("folder")}
-            for s in peer_samples
-        ][-240:]
+        _apply_peer_samples(sess, pid, by_peer[pid])
+        if not sess.sock and pid in peer_meta:
+            sess.sock = peer_meta[pid].get("sock")
+            sess.network = _classify_network(sess.latency_ms, sess.sock)
 
 
 def _query_minutes(query: str) -> int | None:
@@ -742,12 +803,30 @@ def build_snapshot() -> dict[str, Any]:
         if s.latency_ms.get("avg") is not None
     ]
 
+    # First match wins: live/open sessions are listed before completed history
+    net_by_steam: dict[str, dict[str, Any]] = {}
+    for s in sessions:
+        if not s.steam_id or s.steam_id in net_by_steam:
+            continue
+        net_by_steam[s.steam_id] = {
+            "network": s.network,
+            "sock": s.sock,
+        }
+
+    online_out = []
+    for p in players["online"]:
+        row = asdict(p)
+        meta = net_by_steam.get(p.steam_id) or {}
+        row["network"] = meta.get("network") or "unknown"
+        row["sock"] = meta.get("sock")
+        online_out.append(row)
+
     return {
         "generated_at": _iso_now(),
         "source": str(EVENTS_FILE),
         "source_exists": players["source_exists"],
         "source_bytes": players["source_bytes"],
-        "online": [asdict(p) for p in players["online"]],
+        "online": online_out,
         "sessions": [
             {
                 **asdict(s),
@@ -912,6 +991,9 @@ HTML = r"""<!DOCTYPE html>
     tr.clickable{cursor:pointer}
     tr.clickable:hover td{background:#22291c}
     .badge{display:inline-block; margin-left:.35rem; padding:.05rem .4rem; border-radius:999px; border:1px solid #5a3030; color:var(--bad); font-size:.68rem; text-transform:uppercase}
+    .badge.lan{border-color:#3d5a2e; color:var(--ok)}
+    .badge.wan{border-color:#5a4030; color:var(--warn)}
+    .badge.net{border-color:#3a4434; color:var(--muted)}
     .empty{color:var(--muted); font-style:italic; margin:0}
     .tag{display:inline-block; padding:.1rem .4rem; border-radius:999px; border:1px solid var(--line); color:var(--muted); font-size:.7rem; text-transform:uppercase; white-space:nowrap}
     .tag.character{color:var(--ok); border-color:#3d5a2e}
@@ -1076,6 +1158,11 @@ HTML = r"""<!DOCTYPE html>
     function fmtLat(st){
       if(!st || st.samples===0 || st.avg==null) return "—";
       return `${st.min}/${st.avg}/${st.max} ms`;
+    }
+    function netBadge(network){
+      if(network==="lan") return `<span class="badge lan" title="NPS RTT suggests LAN (low avg RTT)">LAN</span>`;
+      if(network==="wan") return `<span class="badge wan" title="NPS RTT suggests WAN (higher avg RTT or non-direct sock)">WAN</span>`;
+      return `<span class="badge net" title="No NPS RTT samples to classify">?</span>`;
     }
     function heat(pct){ if(pct>=85) return "crit"; if(pct>=70) return "hot"; return ""; }
     function plotBounds(times){
@@ -1300,6 +1387,7 @@ HTML = r"""<!DOCTYPE html>
           <div class="box"><div class="l">Disconnected</div><div class="v">${esc(s.disconnected_at?fmtWhen(s.disconnected_at):"still online")}</div></div>
           <div class="box"><div class="l">Duration</div><div class="v">${esc(fmtDur(s.duration_seconds))}</div></div>
           <div class="box"><div class="l">Latency min / avg / max</div><div class="v">${esc(fmtLat(lat))}</div></div>
+          <div class="box"><div class="l">Network</div><div class="v">${netBadge(s.network)}${s.sock?` <span style="color:var(--muted);font-size:.8rem">· ${esc(s.sock)}</span>`:""}</div></div>
           <div class="box"><div class="l">RTT samples</div><div class="v">${esc(lat.samples||0)}</div></div>
           <div class="box"><div class="l">NPS peer id</div><div class="v" style="font-family:ui-monospace,Consolas,monospace;font-size:.85rem">${esc(s.nps_peer_id||"—")}</div></div>
         </div>
@@ -1371,9 +1459,10 @@ HTML = r"""<!DOCTYPE html>
       const online=DATA.online||[];
       document.getElementById("online").innerHTML = online.length ? `
         <div class="table-wrap"><table>
-          <thead><tr><th>Character</th><th>Steam ID</th><th>Connected</th></tr></thead>
+          <thead><tr><th>Character</th><th>Net</th><th>Steam ID</th><th>Connected</th></tr></thead>
           <tbody>${online.map(p=>`<tr>
             <td class="char">${esc(p.character||"(joining…)")}</td>
+            <td>${netBadge(p.network)}</td>
             <td class="steam">${esc(p.steam_id)}</td>
             <td class="time">${esc(fmtWhen(p.connected_at))}</td>
           </tr>`).join("")}</tbody></table></div>` : `<p class="empty">Nobody online</p>`;
@@ -1382,11 +1471,12 @@ HTML = r"""<!DOCTYPE html>
       document.getElementById("sessions").innerHTML = sessions.length ? `
         <div class="table-wrap"><table>
           <thead><tr>
-            <th>Character</th><th>Steam ID</th><th>Start</th><th>End</th>
+            <th>Character</th><th>Net</th><th>Steam ID</th><th>Start</th><th>End</th>
             <th>Duration</th><th>Latency min/avg/max</th>
           </tr></thead>
           <tbody>${sessions.map(s=>`<tr class="clickable ${s.short_session?"short":""}" data-id="${esc(s.id)}">
             <td class="char">${esc(s.character||"—")}${s.short_session?'<span class="badge">short</span>':""}${!s.disconnected_at?'<span class="badge" style="border-color:#3d5a2e;color:var(--ok)">live</span>':""}</td>
+            <td>${netBadge(s.network)}</td>
             <td class="steam">${esc(s.steam_id)}</td>
             <td class="time">${esc(fmtWhen(s.connected_at))}</td>
             <td class="time">${esc(s.disconnected_at?fmtWhen(s.disconnected_at):"—")}</td>
@@ -1401,14 +1491,16 @@ HTML = r"""<!DOCTYPE html>
       const peers=nps.peer_summaries||[];
       document.getElementById("nps").innerHTML = nps.available ? (
         peers.length ? `<div class="table-wrap"><table>
-          <thead><tr><th>Peer id</th><th>Folder</th><th>Latency min/avg/max</th><th>Samples</th></tr></thead>
+          <thead><tr><th>Peer id</th><th>Net</th><th>Sock</th><th>Folder</th><th>Latency min/avg/max</th><th>Samples</th></tr></thead>
           <tbody>${peers.map(p=>`<tr>
             <td class="steam">${esc(p.peer_id)}</td>
+            <td>${netBadge(p.network)}</td>
+            <td class="time">${esc(p.sock||"—")}</td>
             <td class="time">${esc(p.folder||"—")}</td>
             <td>${esc(fmtLat(p.latency_ms))}</td>
             <td>${esc((p.latency_ms||{}).samples||0)}</td>
           </tr>`).join("")}</tbody></table></div>
-          <p class="empty" style="margin-top:.6rem">Peer ids are anonymous NPS session numbers (not Steam IDs). Host self-RTT is filtered out.</p>`
+          <p class="empty" style="margin-top:.6rem">LAN/WAN is inferred from NPS RTT (no client IPs in Valheim logs). Peer ids are ZDOIDs, not Steam IDs.</p>`
         : `<p class="empty">Monitoring is on, but no remote peer RTT samples yet. Join with a client to populate latency.</p>
            <p class="empty">Folders: ${(nps.folders||[]).map(esc).join(", ")||"—"} · samples ${esc(nps.sample_count||0)}</p>`
       ) : `<p class="empty">NpsMonitoring folder not mounted / not found</p>`;
@@ -1425,9 +1517,11 @@ HTML = r"""<!DOCTYPE html>
           const key=g.steam_id || "unknown";
           const n=Number(g.count||(g.events||[]).length||0);
           const isOpen=expandedEventGroups.has(key);
+          const sessMatch=(DATA.sessions||[]).find(s=>s.steam_id===g.steam_id);
           return `<details class="event-group" data-group-key="${esc(key)}"${isOpen?" open":""}>
             <summary>
               <span class="g-char">${esc(name)}</span>
+              ${netBadge(sessMatch && sessMatch.network)}
               <span class="g-steam">${esc(sid)}</span>
               <span class="g-when">last ${esc(fmtWhen(g.last_time))}</span>
               <span class="g-count">${n} event${n===1?"":"s"}</span>
@@ -1509,15 +1603,43 @@ def _token_allows(handler: BaseHTTPRequestHandler, query: str) -> bool:
     return False
 
 
-def request_allowed(handler: BaseHTTPRequestHandler, query: str = "") -> bool:
-    """LAN always; WAN only with active Valheim session and/or ACCESS_TOKEN."""
-    if _token_allows(handler, query):
-        return True
-    if not PUBLIC_SESSION_GATE:
-        return True
+def _basic_password_ok(handler: BaseHTTPRequestHandler) -> bool:
+    """HTTP Basic Auth: any username, password must match SERVER_PASS."""
+    if not SERVER_PASS:
+        return False
+    auth = handler.headers.get("Authorization", "")
+    if not auth.startswith("Basic "):
+        return False
+    try:
+        raw = base64.b64decode(auth.split(" ", 1)[1].strip()).decode("utf-8")
+    except (ValueError, UnicodeDecodeError, IndexError):
+        return False
+    if ":" not in raw:
+        return False
+    _user, password = raw.split(":", 1)
+    return hmac.compare_digest(password, SERVER_PASS)
+
+
+def access_decision(handler: BaseHTTPRequestHandler, query: str = "") -> str:
+    """Return allow | challenge | deny. LAN is always allow.
+
+    WAN default-deny: with PUBLIC_SESSION_GATE, no password prompt unless a
+    Valheim player is online; only then challenge for SERVER_PASS.
+    """
     if _is_private_ip(_client_ip(handler)):
-        return True
-    return _has_active_valheim_session()
+        return "allow"
+    if _token_allows(handler, query):
+        return "allow"
+    # Stealth deny while empty — do not send WWW-Authenticate
+    if PUBLIC_SESSION_GATE and not _has_active_valheim_session():
+        return "deny"
+    if PUBLIC_PASSWORD_GATE:
+        if not SERVER_PASS:
+            return "deny"
+        if _basic_password_ok(handler):
+            return "allow"
+        return "challenge"
+    return "allow"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1525,10 +1647,13 @@ class Handler(BaseHTTPRequestHandler):
         if args and str(args[1]).startswith("5"):
             super().log_message(fmt, *args)
 
-    def _send(self, code: int, body: bytes, content_type: str) -> None:
+    def _send(self, code: int, body: bytes, content_type: str, extra: dict[str, str] | None = None) -> None:
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store")
+        if extra:
+            for key, value in extra.items():
+                self.send_header(key, value)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         try:
@@ -1539,17 +1664,29 @@ class Handler(BaseHTTPRequestHandler):
     def _deny(self) -> None:
         self._send(404, DENIED_BODY, "text/plain; charset=utf-8")
 
+    def _challenge(self) -> None:
+        self._send(
+            401,
+            b"Authentication required\n",
+            "text/plain; charset=utf-8",
+            {"WWW-Authenticate": 'Basic realm="Valheim usage"'},
+        )
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path
+        wan_gated = PUBLIC_PASSWORD_GATE or PUBLIC_SESSION_GATE
         if path == "/healthz":
-            # Keep probes local-only when the session gate is on
-            if PUBLIC_SESSION_GATE and not _is_private_ip(_client_ip(self)):
+            if wan_gated and not _is_private_ip(_client_ip(self)):
                 self._deny()
                 return
             self._send(200, b"ok\n", "text/plain; charset=utf-8")
             return
-        if not request_allowed(self, parsed.query):
+        decision = access_decision(self, parsed.query)
+        if decision == "challenge":
+            self._challenge()
+            return
+        if decision != "allow":
             self._deny()
             return
         if path in ("/", "/index.html"):
@@ -1589,7 +1726,10 @@ def main() -> None:
     print(f"valheim-usage listening on http://{HOST}:{PORT}", flush=True)
     print(
         f"events={EVENTS_FILE} nps={NPS_DIR} metrics={METRICS_FILE} "
-        f"public_session_gate={PUBLIC_SESSION_GATE} token={'set' if ACCESS_TOKEN else 'off'}",
+        f"public_password_gate={PUBLIC_PASSWORD_GATE} "
+        f"public_session_gate={PUBLIC_SESSION_GATE} "
+        f"server_pass={'set' if SERVER_PASS else 'missing'} "
+        f"token={'set' if ACCESS_TOKEN else 'off'}",
         flush=True,
     )
     server.serve_forever()

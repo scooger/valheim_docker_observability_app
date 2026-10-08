@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Live GPU temperature dashboard for the Proxmox host.
+# Live GPU temperature dashboard for a Linux host with a discrete GPU.
 # Reads the nouveau hwmon sensor and plots recent samples in the terminal.
 #
 #   sudo bash scripts/gpu-temp.sh [interval_seconds]

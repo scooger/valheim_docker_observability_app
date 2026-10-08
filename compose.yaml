@@ -61,7 +61,7 @@ services:
     group_add:
       - "983"
     ports:
-      # Usage UI — WAN default-deny; password prompt only while a player is online
+      # Usage UI — see USAGE_PUBLIC_ACCESS in .env for WAN gating
       - "8088:8080"
     env_file:
       - .env
@@ -74,10 +74,8 @@ services:
       VALHEIM_CONTAINER: valheim-server
       METRICS_INTERVAL: "15"
       PORT: "8080"
-      # WAN: 404 if empty; if a player is online, Basic Auth with SERVER_PASS.
-      # LAN (RFC1918) always allowed, no login.
-      PUBLIC_PASSWORD_GATE: "true"
-      PUBLIC_SESSION_GATE: "true"
+      # USAGE_PUBLIC_ACCESS / USAGE_AUTH_MODE / USAGE_PASS come from .env
+      # (see .env.example). LAN always open; WAN gated when public access is on.
       # ACCESS_TOKEN: "change-me"
       # TRUST_PROXY: "true"   # only if behind a reverse proxy that sets X-Forwarded-For
     volumes:

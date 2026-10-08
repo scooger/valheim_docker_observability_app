@@ -35,26 +35,34 @@ RESOURCE_WINDOWS_MIN = (10, 30, 90, 180, 720)
 DEFAULT_WINDOW_MIN = 30
 SPARK_POINTS = 480
 
-# WAN gates (LAN / private IPs always allowed):
-# - PUBLIC_PASSWORD_GATE: HTTP Basic Auth; password must match SERVER_PASS
-# - PUBLIC_SESSION_GATE: optional extra — WAN also needs an online Valheim player
-# - ACCESS_TOKEN: optional alternate WAN unlock
-PUBLIC_PASSWORD_GATE = os.environ.get("PUBLIC_PASSWORD_GATE", "false").lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
-PUBLIC_SESSION_GATE = os.environ.get("PUBLIC_SESSION_GATE", "false").lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
-TRUST_PROXY = os.environ.get("TRUST_PROXY", "false").lower() in ("1", "true", "yes", "on")
+def _env_bool(name: str, default: str = "false") -> bool:
+    return os.environ.get(name, default).lower() in ("1", "true", "yes", "on")
+
+
+# Master switch for internet access to the usage UI (LAN is always open).
+# true  → WAN: 404 while empty; auth (see USAGE_AUTH_MODE) while a player is online
+# false → WAN always 404 (leave TCP 8088 unforwarded, or forward and stay closed)
+USAGE_PUBLIC_ACCESS = _env_bool("USAGE_PUBLIC_ACCESS", "false")
+# WAN password after a player is online:
+#   server_pass → Valheim SERVER_PASS (default)
+#   override    → USAGE_PASS (custom dashboard password)
+#   off         → no password (session presence only)
+USAGE_AUTH_MODE = os.environ.get("USAGE_AUTH_MODE", "server_pass").strip().lower()
+USAGE_PASS = os.environ.get("USAGE_PASS", "").strip()
+TRUST_PROXY = _env_bool("TRUST_PROXY", "false")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "").strip()
 SERVER_PASS = os.environ.get("SERVER_PASS", "").strip()
 DENIED_BODY = b"Not Found\n"
+
+
+def _usage_password() -> str | None:
+    """Password required for WAN Basic Auth, or None if auth is off / unavailable."""
+    if USAGE_AUTH_MODE == "off":
+        return None
+    if USAGE_AUTH_MODE == "override":
+        return USAGE_PASS or None
+    # server_pass (default) and any unknown value
+    return SERVER_PASS or None
 # NPS RTT below this (ms) is treated as LAN; at/above as WAN. No client IPs available.
 LAN_RTT_MS = float(os.environ.get("LAN_RTT_MS", "8"))
 
@@ -1603,9 +1611,9 @@ def _token_allows(handler: BaseHTTPRequestHandler, query: str) -> bool:
     return False
 
 
-def _basic_password_ok(handler: BaseHTTPRequestHandler) -> bool:
-    """HTTP Basic Auth: any username, password must match SERVER_PASS."""
-    if not SERVER_PASS:
+def _basic_password_ok(handler: BaseHTTPRequestHandler, expected: str) -> bool:
+    """HTTP Basic Auth: any username, password must match expected."""
+    if not expected:
         return False
     auth = handler.headers.get("Authorization", "")
     if not auth.startswith("Basic "):
@@ -1617,29 +1625,34 @@ def _basic_password_ok(handler: BaseHTTPRequestHandler) -> bool:
     if ":" not in raw:
         return False
     _user, password = raw.split(":", 1)
-    return hmac.compare_digest(password, SERVER_PASS)
+    return hmac.compare_digest(password, expected)
 
 
 def access_decision(handler: BaseHTTPRequestHandler, query: str = "") -> str:
     """Return allow | challenge | deny. LAN is always allow.
 
-    WAN default-deny: with PUBLIC_SESSION_GATE, no password prompt unless a
-    Valheim player is online; only then challenge for SERVER_PASS.
+    When USAGE_PUBLIC_ACCESS is off, WAN is always denied.
+    When on: WAN is stealth-denied while no Valheim player is online; once a
+    player is online, apply USAGE_AUTH_MODE (server_pass / override / off).
     """
     if _is_private_ip(_client_ip(handler)):
         return "allow"
     if _token_allows(handler, query):
         return "allow"
-    # Stealth deny while empty — do not send WWW-Authenticate
-    if PUBLIC_SESSION_GATE and not _has_active_valheim_session():
+    if not USAGE_PUBLIC_ACCESS:
         return "deny"
-    if PUBLIC_PASSWORD_GATE:
-        if not SERVER_PASS:
-            return "deny"
-        if _basic_password_ok(handler):
-            return "allow"
-        return "challenge"
-    return "allow"
+    # Stealth deny while empty — do not send WWW-Authenticate
+    if not _has_active_valheim_session():
+        return "deny"
+    expected = _usage_password()
+    if USAGE_AUTH_MODE == "off":
+        return "allow"
+    if not expected:
+        # override with empty USAGE_PASS, or server_pass with empty SERVER_PASS
+        return "deny"
+    if _basic_password_ok(handler, expected):
+        return "allow"
+    return "challenge"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1675,9 +1688,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path
-        wan_gated = PUBLIC_PASSWORD_GATE or PUBLIC_SESSION_GATE
         if path == "/healthz":
-            if wan_gated and not _is_private_ip(_client_ip(self)):
+            if USAGE_PUBLIC_ACCESS and not _is_private_ip(_client_ip(self)):
                 self._deny()
                 return
             self._send(200, b"ok\n", "text/plain; charset=utf-8")
@@ -1724,11 +1736,12 @@ def main() -> None:
     threading.Thread(target=metrics_loop, name="metrics", daemon=True).start()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"valheim-usage listening on http://{HOST}:{PORT}", flush=True)
+    expected = _usage_password()
     print(
         f"events={EVENTS_FILE} nps={NPS_DIR} metrics={METRICS_FILE} "
-        f"public_password_gate={PUBLIC_PASSWORD_GATE} "
-        f"public_session_gate={PUBLIC_SESSION_GATE} "
-        f"server_pass={'set' if SERVER_PASS else 'missing'} "
+        f"usage_public_access={USAGE_PUBLIC_ACCESS} "
+        f"usage_auth_mode={USAGE_AUTH_MODE} "
+        f"usage_pass={'set' if expected else ('off' if USAGE_AUTH_MODE == 'off' else 'missing')} "
         f"token={'set' if ACCESS_TOKEN else 'off'}",
         flush=True,
     )

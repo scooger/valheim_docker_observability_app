@@ -64,7 +64,7 @@ If key login for `YOUR_ADMIN` is not set up yet, use password auth:
 scp .\.scratch\bootstrap-cursor-user.sh YOUR_ADMIN@YOUR_LAN_IP:~/
 ```
 
-Or paste the script onto the host with an editor / the Proxmox or physical console.
+Or paste the script onto the host with an editor or the machine’s local console.
 
 ## 4. Run the bootstrap as root
 
@@ -104,7 +104,7 @@ Host docker
   IdentitiesOnly yes
 ```
 
-Keep any older host entries for previous guests if you still use them.
+Keep any older host entries if you still use other machines.
 
 ## 6. Verify
 

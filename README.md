@@ -1,45 +1,31 @@
 # Valheim server
 
-Docker Compose stack for a Valheim dedicated server on a Proxmox guest, using [`lloesche/valheim-server`](https://hub.docker.com/r/lloesche/valheim-server). World files, backups, and config live in `state/` and survive container rebuilds.
+Docker Compose stack for a Valheim dedicated server on a remote Linux host running Docker, using [`lloesche/valheim-server`](https://hub.docker.com/r/lloesche/valheim-server). World files, backups, and config live in `state/` and survive container rebuilds.
 
-Run the game server in a VM (or an existing Docker guest). Leave Docker off the Proxmox host itself.
+## 1. Prepare the Docker host
 
-## 1. Create the Proxmox guest
+Any Debian/Ubuntu machine with Docker is fine (bare metal or a VM elsewhere). Valheim wants a few fast cores and enough RAM to stay off swap — about **4 CPU** and **8 GB RAM** is a solid baseline.
 
-A small VM is the reliable option. Valheim wants a few fast cores and enough RAM to stay off swap.
-
-| Setting | Value |
-| --- | --- |
-| OS | Debian 12 or Ubuntu 24.04 Server |
-| Machine | q35 |
-| BIOS | SeaBIOS (OVMF also works) |
-| Disk | 32 GB VirtIO SCSI, Discard enabled |
-| CPU | `host`, 4 cores |
-| Memory | 8192 MB, ballooning device **off** |
-| Network | VirtIO on `vmbr0` (the bridge that faces your UniFi LAN) |
-| QEMU Guest Agent | Enabled |
-| Firewall | Off on the VM (the Gateway Ultra is the firewall) |
-
-Install the OS, then install `sudo` and `openssh-server` if the installer did not. Confirm the guest got an address from UniFi:
+Install `sudo` and `openssh-server` if needed, then confirm the host has a LAN address:
 
 ```bash
 ip -4 addr
 ```
 
-Copy this folder to the guest (from your PC):
+Copy this folder to the host (from your PC):
 
 ```bash
-scp -r valheim_server you@GUEST_IP:/opt/valheim-server
+scp -r valheim_server you@YOUR_LAN_IP:/opt/valheim-server
 ```
 
-On the guest:
+On the host:
 
 ```bash
 cd /opt/valheim-server
 sudo bash scripts/setup.sh
 ```
 
-The script installs Docker Engine, creates a `valheim` user, writes `.env` with a random password, and starts the server. The first start downloads about 1 GB from Steam. Watch it until the log settles:
+The script installs Docker Engine if needed, creates a `valheim` user, writes `.env` with a random password, and starts the server. The first start downloads about 1 GB from Steam. Watch it until the log settles:
 
 ```bash
 sudo docker compose logs -f
@@ -61,17 +47,15 @@ On the PC that has the world, copy the `.db` and `.fwl` files from:
 
 `%USERPROFILE%\AppData\LocalLow\IronGate\Valheim\worlds_local`
 
-into `state/config/worlds_local/` on the guest. Set `WORLD_NAME` to that filename without the extension, then `sudo docker compose up -d`.
+into `state/config/worlds_local/` on the host. Set `WORLD_NAME` to that filename without the extension, then `sudo docker compose up -d`.
 
-### Already running Docker on a guest
+### Docker already installed
 
-Skip the VM section. Copy the folder over and run `sudo bash scripts/setup.sh`.
-
-An LXC only works if it is privileged and has `nesting=1` (and usually `keyctl=1`). An unprivileged container will fail when Docker starts. A VM avoids that.
+Skip the installer path in `setup.sh` if Docker is present — the script detects it and continues. Copy the folder over and run `sudo bash scripts/setup.sh`.
 
 ## 2. UniFi Cloud Gateway Ultra
 
-Do this after the guest has an address. The forward target has to stay on that address.
+Do this after the host has a stable address. The forward target has to stay on that address.
 
 ### Confirm the WAN is a public address
 
@@ -88,23 +72,22 @@ If the ISP will not give you a public IPv4, set `CROSSPLAY=true` in `.env` and r
 
 Leave UPnP off. **Settings → Internet → UPnP** should stay disabled. These forwards are explicit.
 
-### Guest address
+### Host address
 
-This host uses a **static** address (`YOUR_LAN_IP/24`), gateway `YOUR_GATEWAY_IP`. You do **not** need a UniFi DHCP reservation.
+Give the Docker host a **static** LAN address (`YOUR_LAN_IP/24`, gateway `YOUR_GATEWAY_IP`), or a UniFi **Fixed IP** reservation so the forward target cannot drift.
 
-If you ever rebuild with DHCP instead, set a **Fixed IP** in UniFi (**Client Devices** → the VM) so the forward target cannot drift.
+### Forward the ports
 
-### Forward the game ports
+| Name | Protocol | WAN port | Forward IP | Forward port | Required |
+| --- | --- | --- | --- | --- | --- |
+| Valheim game | UDP | 2456 | host fixed IP | 2456 | Yes |
+| Valheim query | UDP | 2457 | host fixed IP | 2457 | Yes |
+| Valheim crossplay | UDP | 2458 | host fixed IP | 2458 | Yes |
+| Usage dashboard | TCP | 8088 | host fixed IP | 8088 | Only if `USAGE_PUBLIC_ACCESS=true` |
 
-Valheim listens on UDP only.
+2456 is the port players type. 2457 is the Steam query port (public server list and Steam favorites). 2458 is used when `CROSSPLAY=true`, and by some mods. Forward all three UDP ports so turning crossplay on later does not need another firewall change.
 
-| Name | Protocol | WAN port | Forward IP | Forward port |
-| --- | --- | --- | --- | --- |
-| Valheim game | UDP | 2456 | guest fixed IP | 2456 |
-| Valheim query | UDP | 2457 | guest fixed IP | 2457 |
-| Valheim crossplay | UDP | 2458 | guest fixed IP | 2458 |
-
-2456 is the port players type. 2457 is the Steam query port (public server list and Steam favorites). 2458 is used when `CROSSPLAY=true`, and by some mods. Forward all three so turning crossplay on later does not need another firewall change.
+**8088** is the usage / monitoring web UI. Only forward it when you want friends on the internet to open the dashboard. Leave it unforwarded for LAN-only monitoring. See [Usage web](#usage-web) for WAN vs LAN access rules.
 
 Where to click depends on the Network application version on the Gateway Ultra:
 
@@ -116,11 +99,13 @@ For each rule:
 
 - **WAN:** your primary WAN (or All, if you only have one)
 - **From:** Any
-- **Protocol:** UDP (not Both)
+- **Protocol:** UDP for 2456–2458, **TCP** for 8088 (not Both)
 - **Forward IP:** `YOUR_LAN_IP`
 - **Forward port:** the same number as the WAN port
 
-Saving a forward creates a matching firewall allow (External → the zone the guest lives in, often Internal). Leave that allow in place. You do not add a second firewall rule for the same ports.
+Saving a forward creates a matching firewall allow (External → the zone the host lives in, often Internal). Leave that allow in place. You do not add a second firewall rule for the same ports.
+
+Do **not** forward TCP **9443** (Portainer) — keep that LAN-only.
 
 Optional: if every friend has a stable public IP, set **From** to those addresses instead of Any. That is tighter, and it breaks the moment a friend's ISP changes their address. Any plus the server password is the usual home setup.
 
@@ -128,14 +113,12 @@ Optional: if every friend has a stable public IP, set **From** to those addresse
 
 People on your LAN join with `YOUR_LAN_IP:2456`. Joining your own public IP from inside the LAN (NAT hairpin) is unreliable. Outside players use the public WAN address and port 2456.
 
-If you previously forwarded to the old VM (`YOUR_OLD_LAN_IP`), update those UniFi rules to `YOUR_LAN_IP`.
-
-### Optional: put the guest on its own VLAN
+### Optional: put the host on its own VLAN
 
 Not required. If you want it off the main LAN:
 
 1. **Settings → Networks → New Virtual Network.** VLAN ID `30`, subnet such as `192.168.30.0/24`, DHCP on. Leave the zone as Internal if your PC should still SSH to it. A more isolated zone means you also need a LAN → that zone allow for SSH.
-2. On the Proxmox VM NIC, set VLAN tag `30`. `vmbr0` must be VLAN-aware, or the tag never leaves the host.
+2. Put the Docker host on that network (switch port / NIC VLAN as appropriate for your hardware).
 3. Reserve the fixed IP on that network and point the three forwards at it.
 
 ## 3. Join
@@ -144,7 +127,7 @@ In Valheim: **Join Game → Join IP**.
 
 - Same house: `YOUR_LAN_IP:2456`
 - From the internet: your public WAN address and port `2456`
-- Password: `SERVER_PASS` in `.env` on the guest
+- Password: `SERVER_PASS` in `.env` on the host
 
 With `SERVER_PUBLIC=false` (the default here) the server is not listed in Steam or the community browser. Friends join only by IP and password.
 
@@ -152,7 +135,7 @@ Set `SERVER_PUBLIC=true` if you want it on the public list under `SERVER_NAME`. 
 
 ## Persistence
 
-World data survives container and VM reboots. It lives on the guest disk, not inside the image:
+World data survives container and host reboots. It lives on the host disk, not inside the image:
 
 | Host path | Container path | Contents |
 | --- | --- | --- |
@@ -166,7 +149,7 @@ Player characters are stored on each player's PC, not on this server. Only the s
 
 ## OS updates
 
-Weekly full OS updates run via cron on the guest:
+Weekly full OS updates run via cron on the host:
 
 - **When:** Sundays **03:00** America/New_York
 - **Enable:** `sudo bash scripts/enable-weekly-os-updates.sh`
@@ -184,15 +167,55 @@ On first visit, create the admin user within 5 minutes (Portainer locks the wiza
 
 Separate image (`usage-web/`) serves sessions from `player-events.log`, NPS RTT from `NpsMonitoring/`, plus host/Valheim CPU and memory:
 
-- UI: **http://YOUR_LAN_IP:8088/** — summary min/avg/max for duration and latency; click a session for events + RTT chart
-- JSON: **http://YOUR_LAN_IP:8088/api/status** · session detail: `/api/session/<id>`
+- LAN UI: **http://YOUR_LAN_IP:8088/**
+- WAN UI (if forwarded): **http://YOUR_PUBLIC_IP:8088/**
+- JSON: `/api/status` · session detail: `/api/session/<id>`
 
 Sessions under 2 minutes are flagged **short**. Latency appears once a client is online with NPS monitoring enabled (host self-RTT is filtered out). Resource samples live in `state/usage/metrics.jsonl`.
 
-**Public access** (`PUBLIC_PASSWORD_GATE` + `PUBLIC_SESSION_GATE`): LAN clients always see the UI with no login. Internet is **default-deny** (plain `404`) while nobody is in Valheim — no password prompt. When at least one player is online, WAN gets HTTP Basic Auth (`SERVER_PASS`, any username). Wrong password → 401. Optional `ACCESS_TOKEN` is an alternate WAN unlock.
+### LAN vs WAN access
+
+The app classifies clients by **TCP source IP** (RFC1918 / loopback = LAN; anything else = WAN).
+
+| Client | Behavior |
+| --- | --- |
+| LAN (`YOUR_LAN_IP`, home network) | Always open — **no login** |
+| WAN, `USAGE_PUBLIC_ACCESS=false` | Always **404** (feature off) |
+| WAN, `USAGE_PUBLIC_ACCESS=true`, nobody in Valheim | **404** — no password prompt (looks offline) |
+| WAN, public on, player online, `USAGE_AUTH_MODE=server_pass` | Browser login — password = `SERVER_PASS` |
+| WAN, public on, player online, `USAGE_AUTH_MODE=override` | Browser login — password = `USAGE_PASS` |
+| WAN, public on, player online, `USAGE_AUTH_MODE=off` | Open — **no login** |
+| WAN, wrong password | **401** |
+
+This is presence gating (plus optional password), not per-player IP binding. While someone is in-game, anyone who can reach `:8088` and satisfy the auth mode can open the dashboard.
+
+### Enable or disable public access
+
+In `.env` on the host:
+
+```bash
+# false = WAN always closed (safe if you do not forward 8088)
+# true  = allow internet access with the rules above
+USAGE_PUBLIC_ACCESS=false
+
+# Password for WAN when a player is online:
+#   server_pass = Valheim SERVER_PASS (default)
+#   override    = custom password in USAGE_PASS
+#   off         = no password
+USAGE_AUTH_MODE=server_pass
+USAGE_PASS=
+```
+
+Then recreate the usage container:
 
 ```bash
 cd /opt/valheim-server
+sudo docker compose up -d usage
+```
+
+When set to `true`, also add the UniFi **TCP 8088** forward from the table above. When `false`, leave 8088 unforwarded.
+
+```bash
 sudo docker compose build usage && sudo docker compose up -d usage
 ```
 
@@ -222,7 +245,7 @@ Valheim does **not** log client IPs (Steam networking). The dashboard can show U
 
 ## Day to day
 
-From `/opt/valheim-server` on the guest:
+From `/opt/valheim-server` on the host:
 
 ```bash
 sudo docker compose logs -f          # live log
@@ -244,5 +267,7 @@ To make someone an admin, set `ADMINLIST_IDS` in `.env` to their SteamID64 (spac
 | 2456 | UDP | Game |
 | 2457 | UDP | Steam matchmaking / query |
 | 2458 | UDP | Crossplay (PlayFab) and some mod RPC |
+| 8088 | TCP | Usage web — forward only when `USAGE_PUBLIC_ACCESS=true` |
+| 9443 | TCP | Portainer (LAN only — do not forward) |
 
-Nothing in this stack listens on TCP. Do not forward TCP for these ports.
+Do not forward TCP for the Valheim game ports (2456–2458).

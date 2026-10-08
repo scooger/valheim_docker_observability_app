@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install Docker (if needed) and start the Valheim server on a Debian/Ubuntu Proxmox guest.
+# Install Docker (if needed) and start the Valheim server on a Debian/Ubuntu Docker host.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,13 +26,6 @@ if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>
 fi
 
 systemctl enable --now docker
-
-if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --quiet; then
-  if [[ "$(systemd-detect-virt || true)" == "kvm" ]]; then
-    apt-get install -y qemu-guest-agent
-    systemctl enable --now qemu-guest-agent || true
-  fi
-fi
 
 if ! id valheim >/dev/null 2>&1; then
   useradd \
@@ -85,5 +78,5 @@ echo
 echo "LAN address: ${lan_ip:-unknown}:2456"
 echo "Password is SERVER_PASS in ${ROOT}/.env"
 echo
-echo "Next: on the UniFi Gateway Ultra, reserve ${lan_ip:-the guest IP} and forward UDP 2456-2458 to it."
+echo "Next: on the UniFi Gateway Ultra, reserve ${lan_ip:-the host IP} and forward UDP 2456-2458 to it."
 echo "Steps are in README.md."
